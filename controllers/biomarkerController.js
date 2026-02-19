@@ -69,32 +69,15 @@ export const importFromFile = async (req, res) => {
       ? XLSX.read(req.file.buffer.toString('utf8'), { type: 'string' })
       : XLSX.read(req.file.buffer, { type: 'buffer' });
 
-    // Read ALL sheets; extend range beyond !ref if cells exist further down (XLSX may truncate at blank row)
-    const rawRows = [];
-    for (const sheetName of workbook.SheetNames) {
-      const worksheet = workbook.Sheets[sheetName];
-      let opts = { defval: '' };
-      // Find max row from actual cell keys (A1, B2765, etc.) in case !ref is truncated
-      let maxRow = 0;
-      for (const key of Object.keys(worksheet)) {
-        if (key.startsWith('!')) continue;
-        const match = key.match(/^([A-Z]+)(\d+)$/);
-        if (match) {
-          const row = parseInt(match[2], 10) - 1; // 0-indexed
-          if (row > maxRow) maxRow = row;
-        }
+    let rawRows;
+    if (isCsv) {
+      rawRows = [];
+      for (const sn of workbook.SheetNames) {
+        const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sn], { defval: '' });
+        if (rows.length > 0) rawRows.push(...rows);
       }
-      if (worksheet['!ref']) {
-        try {
-          const range = XLSX.utils.decode_range(worksheet['!ref']);
-          range.e.r = Math.max(range.e.r, maxRow, 5000); // use actual max or at least 5000
-          opts.range = XLSX.utils.encode_range(range);
-        } catch (_) {}
-      }
-      const sheetRows = XLSX.utils.sheet_to_json(worksheet, opts);
-      if (Array.isArray(sheetRows) && sheetRows.length > 0) {
-        rawRows.push(...sheetRows);
-      }
+    } else {
+      rawRows = parseWorkbookToEntries(workbook);
     }
 
     if (rawRows.length === 0) {
@@ -175,27 +158,20 @@ export const importFromFile = async (req, res) => {
       };
     };
 
-    // Keep rows that have: (1) antibody/name, OR (2) manifestation, OR (3) disease in raw, OR (4) any non-empty data in raw
-    const hasAntibodyOrName = (e) => e.name && e.name.length > 0;
-    const hasManifestation = (e) => e.manifestation && e.manifestation.length > 0;
-    const hasDiseaseInRaw = (e) => e.raw && (e.raw.Disease || e.raw.disease || Object.keys(e.raw).some((k) => /disease/i.test(k)));
-    const hasAnyRawData = (e) => e.raw && Object.keys(e.raw).length > 0;
-
-    const entries = rawRows
-      .map((row) => mapRow(row))
-      .filter((e) => hasAntibodyOrName(e) || hasManifestation(e) || hasDiseaseInRaw(e) || hasAnyRawData(e));
+    const mapped = rawRows.map((row) => mapRow(row));
+    // Keep rows that have at least one non-empty cell (filter out completely blank rows only)
+    const entries = mapped.filter((e) => e.raw && Object.keys(e.raw).length > 0);
 
     if (entries.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'No valid rows found. File should have at least: Name/Autoantibody/Biomarker, Manifestation, or Disease',
+        message: 'No rows with data found in file',
       });
     }
 
     const result = await Biomarker.insertMany(entries);
-    const filteredCount = rawRows.length - entries.length;
 
-    console.log(`Biomarker import: ${workbook.SheetNames.length} sheet(s), ${rawRows.length} rows read → ${entries.length} valid → ${result.length} inserted (${filteredCount} filtered out)`);
+    console.log(`Biomarker import: ${workbook.SheetNames.length} sheet(s), ${rawRows.length} rows → ${result.length} inserted`);
 
     res.json({
       success: true,
@@ -203,8 +179,6 @@ export const importFromFile = async (req, res) => {
       data: {
         inserted: result.length,
         total: rawRows.length,
-        validRows: entries.length,
-        filteredOut: filteredCount,
         failed: rawRows.length - result.length,
         sheetsRead: workbook.SheetNames.length,
       },
@@ -225,8 +199,10 @@ function parseSheetAllCells(worksheet) {
   let maxCol = -1;
   for (const key of Object.keys(worksheet)) {
     if (key.startsWith('!')) continue;
-    const addr = XLSX.utils.decode_cell(key);
-    if (addr == null) continue;
+    let addr;
+    try {
+      addr = XLSX.utils.decode_cell(key);
+    } catch (_) { continue; }
     const { r, c } = addr;
     if (r > maxRow) maxRow = r;
     if (c > maxCol) maxCol = c;
@@ -240,15 +216,15 @@ function parseSheetAllCells(worksheet) {
   const headerRow = rowsByIndex[0] || {};
   const headers = [];
   for (let c = 0; c <= maxCol; c++) {
-    headers.push(headerRow[c] != null ? headerRow[c] : `_col${c}`);
+    const h = headerRow[c];
+    headers.push(h != null && String(h).trim() !== '' ? String(h).trim() : `_col${c}`);
   }
   const rawRows = [];
   for (let r = 1; r <= maxRow; r++) {
     const rowObj = {};
     const row = rowsByIndex[r] || {};
     for (let c = 0; c <= maxCol; c++) {
-      const h = headers[c];
-      if (h && h !== `_col${c}`) rowObj[h] = row[c] != null ? row[c] : '';
+      rowObj[headers[c]] = row[c] != null ? row[c] : '';
     }
     rawRows.push(rowObj);
   }
@@ -317,18 +293,20 @@ export const importFromServerFile = async (req, res) => {
     }
     const buffer = fs.readFileSync(SERVER_DATA_FILE);
     const workbook = XLSX.read(buffer, { type: 'buffer' });
-    const rawRows = await parseWorkbookToEntries(workbook);
-    const entries = rawRows.map(mapRowToBiomarker).filter((e) => (e.name && e.name.length > 0) || (e.manifestation && e.manifestation.length > 0) || (e.prevalence && e.prevalence.length > 0) || (e.raw && Object.keys(e.raw).length > 0));
+    const rawRows = parseWorkbookToEntries(workbook);
+    const mapped = rawRows.map(mapRowToBiomarker);
+    // Keep only rows with at least one non-empty cell (skip completely blank rows)
+    const entries = mapped.filter((e) => e.raw && Object.keys(e.raw).length > 0);
     if (entries.length === 0) {
-      return res.status(400).json({ success: false, message: 'No valid rows in file' });
+      return res.status(400).json({ success: false, message: 'No rows with data in file' });
     }
     await Biomarker.deleteMany({});
     const result = await Biomarker.insertMany(entries);
-    console.log(`Biomarker import from server file: ${rawRows.length} rows → ${entries.length} valid → ${result.length} inserted`);
+    console.log(`Biomarker import from server file: ${rawRows.length} rows → ${result.length} inserted`);
     res.json({
       success: true,
       message: `Imported ${result.length} biomarker entries from server file`,
-      data: { inserted: result.length, total: rawRows.length, validRows: entries.length },
+      data: { inserted: result.length, total: rawRows.length, failed: rawRows.length - result.length },
     });
   } catch (error) {
     console.error('Import from server file error:', error);
@@ -411,21 +389,29 @@ export const deleteAllBiomarkers = async (req, res) => {
   }
 };
 
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export const searchBiomarkers = async (req, res) => {
   try {
     const { search } = req.query;
     let query = {};
 
     if (search) {
+      const escaped = escapeRegex(search.trim());
+      const searchRegex = new RegExp(escaped, 'i');
       query = {
         $or: [
-          { name: { $regex: search, $options: 'i' } },
-          { manifestation: { $regex: search, $options: 'i' } },
-          { 'raw.Disease': { $regex: search, $options: 'i' } },
-          { 'raw.Autoantibody': { $regex: search, $options: 'i' } },
-          { 'raw.Biomarker': { $regex: search, $options: 'i' } },
-          { 'raw.Name': { $regex: search, $options: 'i' } },
-          { 'raw.Antibody': { $regex: search, $options: 'i' } },
+          { name: searchRegex },
+          { manifestation: searchRegex },
+          { 'raw.Disease': searchRegex },
+          { 'raw.disease': searchRegex },
+          { 'raw.Autoantibody': searchRegex },
+          { 'raw.Biomarker': searchRegex },
+          { 'raw.Name': searchRegex },
+          { 'raw.Antibody': searchRegex },
+          { 'raw.Antibodies': searchRegex },
         ],
       };
     }
