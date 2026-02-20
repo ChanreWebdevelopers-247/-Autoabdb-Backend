@@ -7,8 +7,7 @@ import routes from './routes/index.js';
 
 // Load environment variables
 dotenv.config();
-// Connect to the Database
-connectDB();
+
 const app = express();
 // Middleware
 app.use(express.json());
@@ -33,6 +32,17 @@ app.use('/', routes);
 app.use('/api', routes);
 
 const PORT = process.env.PORT || 5001;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+
+async function startServer() {
+  try {
+    await connectDB();
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+  } catch (err) {
+    console.error('Failed to start server:', err.message);
+    process.exit(1);
+  }
+}
+
+startServer();

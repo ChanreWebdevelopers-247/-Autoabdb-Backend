@@ -15,18 +15,22 @@ const transporter = nodemailer.createTransport({
 });
 
 // Verify transporter configuration
-transporter.verify((error, success) => {
-  if (error) {
-    console.error('SMTP Configuration Error:', error);
-  } else {
-    console.log('SMTP Server is ready to send emails');
-  }
-});
+if (process.env.BREVO_SMTP_LOGIN && process.env.BREVO_SMTP_KEY && process.env.BREVO_SMTP_LOGIN !== 'your_brevo_login_email') {
+  transporter.verify((error, success) => {
+    if (error) {
+      console.error('SMTP Configuration Error:', error);
+    } else {
+      console.log('SMTP Server is ready to send emails');
+    }
+  });
+} else {
+  console.log('SMTP credentials missing or default. Email service verification skipped.');
+}
 
 export const sendPasswordResetEmail = async (email, resetToken, userName) => {
   try {
     const resetUrl = `${process.env.FRONTEND_URL}/auth/reset-password?token=${resetToken}`;
-    
+
     const mailOptions = {
       from: {
         name: 'Chanre Veena',
@@ -217,16 +221,16 @@ export const sendPasswordResetEmail = async (email, resetToken, userName) => {
 
     const info = await transporter.sendMail(mailOptions);
     console.log('Password reset email sent successfully:', info.messageId);
-    return { 
-      success: true, 
+    return {
+      success: true,
       messageId: info.messageId,
       accepted: info.accepted,
-      rejected: info.rejected 
+      rejected: info.rejected
     };
-    
+
   } catch (error) {
     console.error('Error sending email via SMTP:', error);
-    
+
     // More detailed error handling
     if (error.code === 'EAUTH') {
       throw new Error('SMTP Authentication failed. Please check your Brevo credentials.');
